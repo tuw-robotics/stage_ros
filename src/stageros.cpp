@@ -41,6 +41,7 @@
 #include <ros/ros.h>
 #include <boost/thread/mutex.hpp>
 #include <boost/thread/thread.hpp>
+#include <boost/circular_buffer.hpp>
 #include <sensor_msgs/LaserScan.h>
 #include <sensor_msgs/Image.h>
 #include <sensor_msgs/image_encodings.h>
@@ -118,7 +119,8 @@ private:
 
         ros::Subscriber cmdvel_sub; //one cmd_vel subscriber
 
-        VelocityCmdsDiffDrive cmdsDes;
+        boost::circular_buffer<struct VelocityCmdsDiffDrive> cmdsDes;
+        struct VelocityCmdsDiffDrive cmdsDes_current;
     };
 
     std::vector<StageRobot*> robotmodels_;
@@ -293,8 +295,8 @@ void
 StageNode::cmdvelReceivedConstrainedDiffDrive(int idx, const boost::shared_ptr<geometry_msgs::Twist const>& msg)
 {
     boost::mutex::scoped_lock lock(msg_lock);
-    this->robotmodels_[idx]->cmdsDes.v = msg->linear.x;
-    this->robotmodels_[idx]->cmdsDes.w = msg->angular.z;
+    this->robotmodels_[idx]->cmdsDes_current.v = msg->linear.x;
+    this->robotmodels_[idx]->cmdsDes_current.w = msg->angular.z;
     this->base_last_cmd = this->sim_time;
 }
 
@@ -443,6 +445,8 @@ StageNode::SubscribeModels()
                 new_robot->fiducial_pubs.push_back(n_.advertise<marker_msgs::MarkerDetection>(mapName(BASE_MARKER_DETECTION, r, s, static_cast<Stg::Model*>(new_robot->positionmodel)), 10));
         }
 
+        struct VelocityCmdsDiffDrive nullcmd = {0, 0};
+        new_robot->cmdsDes.resize(1, nullcmd);
         this->robotmodels_.push_back(new_robot);
     }
     clock_pub_ = n_.advertise<rosgraph_msgs::Clock>("/clock", 10);
@@ -460,16 +464,18 @@ StageNode::SubscribeModels()
 void StageNode::callbackConfig ( stage_ros::StageRosConfig& _config, uint32_t _level ) {
     config_ = _config;
 
-    if(!config_.constrainedDiffDrive) {
-        for(size_t i = 0; i < robotmodels_.size(); ++i) {
-            StageNode::StageRobot* robotModelsI = robotmodels_[i];
-            robotModelsI->cmdvel_sub = n_.subscribe<geometry_msgs::Twist>(mapName(CMD_VEL, i, static_cast<Stg::Model*>(robotModelsI->positionmodel)), 10, boost::bind(&StageNode::cmdvelReceived, this, i, _1));
-        }
-    } else {
-        for(size_t i = 0; i < robotmodels_.size(); ++i) {
-            StageNode::StageRobot* robotModelsI = robotmodels_[i];
-            robotModelsI->cmdvel_sub = n_.subscribe<geometry_msgs::Twist>(mapName(CMD_VEL, i, static_cast<Stg::Model*>(robotModelsI->positionmodel)), 10, boost::bind(&StageNode::cmdvelReceivedConstrainedDiffDrive, this, i, _1));
-        }
+    for(size_t i = 0; i < robotmodels_.size(); ++i) {
+        StageNode::StageRobot* robotModelsI = robotmodels_[i];
+        robotModelsI->cmdvel_sub = n_.subscribe<geometry_msgs::Twist>(mapName(CMD_VEL, i, static_cast<Stg::Model*>(robotModelsI->positionmodel)), 10,
+                                                                      boost::bind( (config_.constrainedDiffDrive ?
+                                                                                   &StageNode::cmdvelReceivedConstrainedDiffDrive :
+                                                                                   &StageNode::cmdvelReceived),
+                                                                                  this, i, _1)
+                                                                     );
+
+        struct VelocityCmdsDiffDrive nullcmd = {0, 0};
+        robotModelsI->cmdsDes.resize(1 + config_.cmd_vel_dead_time * 10, nullcmd); // 10 = Rate
+        robotModelsI->cmdsDes.set_capacity(1 + config_.cmd_vel_dead_time * 10); // 10 = Rate
     }
 }
 
@@ -499,10 +505,13 @@ StageNode::WorldCallback()
 
         for(size_t i = 0; i < robotmodels_.size(); ++i) {
             StageRobot* robModelsI = robotmodels_[i];
+            robModelsI->cmdsDes.push_back(robModelsI->cmdsDes_current);
+
             double vPrev = positionmodels[i]->GetVelocity().x;
             double wPrev = positionmodels[i]->GetVelocity().a;
-            double v = robModelsI->cmdsDes.v;
-            double w = robModelsI->cmdsDes.w;
+            struct VelocityCmdsDiffDrive cmds = robModelsI->cmdsDes.front();
+            double v = cmds.v;
+            double w = cmds.w;
 
             const double vWRPrev = vPrev + wPrev * config_.diffDrive_dWheels / (2.);
             const double vWLPrev = vPrev - wPrev * config_.diffDrive_dWheels / (2.);
@@ -551,8 +560,8 @@ StageNode::WorldCallback()
         if(config_.constrainedDiffDrive) {
             for (size_t r = 0; r < this->positionmodels.size(); r++) {
                 StageRobot* robModelsI = robotmodels_[r];
-                robModelsI->cmdsDes.v = 0;
-                robModelsI->cmdsDes.w = 0;
+                robModelsI->cmdsDes_current.v = 0;
+                robModelsI->cmdsDes_current.w = 0;
             }
         } else {
             for (size_t r = 0; r < this->positionmodels.size(); r++)
